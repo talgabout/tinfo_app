@@ -121,6 +121,26 @@ class NewsItem {
   }
 }
 
+/// Category from [categories.php] (id + name) for server-side filtered feeds.
+class NewsCategoryEntry {
+  const NewsCategoryEntry({required this.id, required this.name});
+
+  final int id;
+  final String name;
+
+  static int apiIdForLabel(String label, List<NewsCategoryEntry> entries) {
+    if (label == 'Все') {
+      return NewsApiService.kRootCategoryId;
+    }
+    for (final e in entries) {
+      if (e.name == label) {
+        return e.id;
+      }
+    }
+    return NewsApiService.kRootCategoryId;
+  }
+}
+
 class NewsApiService {
   // New custom endpoint package in public_html/endpoint
   static const String _apiBaseUrl = 'https://www.tinfo.kz/endpoint';
@@ -128,9 +148,28 @@ class NewsApiService {
   static const String _legacyWsBaseUrl = 'https://www.tinfo.kz/ws';
   static const int _defaultCatId = 1;
 
-  Future<List<NewsItem>> fetchNews() async {
+  /// Root category for «Все» / home feed (matches previous hard-coded list).
+  static const int kRootCategoryId = _defaultCatId;
+
+  /// Page size for list pagination (15–25 is typical for mobile feeds).
+  static const int kNewsPageSize = 20;
+
+  /// One-based [page] for the primary API; legacy uses zero-based page index.
+  /// [categoryId] selects Joomla/K2 category; omit or use [kRootCategoryId] for the main tree.
+  Future<List<NewsItem>> fetchNewsPage(
+    int page, {
+    int? limit,
+    int? categoryId,
+  }) async {
+    final lim = limit ?? kNewsPageSize;
+    if (page < 1) {
+      throw ArgumentError.value(page, 'page', 'must be >= 1');
+    }
+    final catId = categoryId ?? kRootCategoryId;
     try {
-      final uri = Uri.parse('$_apiBaseUrl/news.php?categoryId=$_defaultCatId&page=1&limit=30');
+      final uri = Uri.parse(
+        '$_apiBaseUrl/news.php?categoryId=$catId&page=$page&limit=$lim',
+      );
       final response = await http.get(uri).timeout(
         const Duration(seconds: 12),
         onTimeout: () => throw Exception('API timeout. Check endpoint URL and server.'),
@@ -144,9 +183,12 @@ class NewsApiService {
       final list = _extractNewsList(decoded);
       return list.map(NewsItem.fromJson).toList();
     } catch (_) {
-      final legacy = Uri.parse(
-        '$_legacyWsBaseUrl/getArticles.php?catId=$_defaultCatId&page=0&isparent=1',
-      );
+      final legacyPage = page - 1;
+      final isRoot = catId == kRootCategoryId;
+      final legacyUri = isRoot
+          ? '$_legacyWsBaseUrl/getArticles.php?catId=$catId&page=$legacyPage&isparent=1'
+          : '$_legacyWsBaseUrl/getArticles.php?catId=$catId&page=$legacyPage';
+      final legacy = Uri.parse(legacyUri);
       final response = await http.get(legacy).timeout(
         const Duration(seconds: 12),
         onTimeout: () => throw Exception('Legacy API timeout.'),
@@ -158,6 +200,42 @@ class NewsApiService {
       final list = _extractNewsList(decoded);
       return list.map(NewsItem.fromJson).toList();
     }
+  }
+
+  /// First page only (used where a single batch is enough).
+  Future<List<NewsItem>> fetchNews() => fetchNewsPage(1);
+
+  Future<List<NewsCategoryEntry>> fetchCategoryEntries() async {
+    final uri = Uri.parse('$_apiBaseUrl/categories.php?rootId=$_defaultCatId');
+    final response = await http.get(uri).timeout(
+      const Duration(seconds: 12),
+      onTimeout: () => throw Exception('API timeout. Check endpoint URL and server.'),
+    );
+    if (response.statusCode != 200) {
+      throw Exception('Failed to load categories: ${response.statusCode}');
+    }
+
+    final dynamic decoded = jsonDecode(response.body);
+    final map = _extractResponseMap(decoded);
+    if ((map['ok'] as bool?) == false) {
+      throw Exception(_asString(map['error'], fallback: 'Categories request failed'));
+    }
+
+    final dynamic items = map['items'];
+    if (items is! List) {
+      return <NewsCategoryEntry>[];
+    }
+    final out = <NewsCategoryEntry>[];
+    for (final raw in items) {
+      if (raw is Map<String, dynamic>) {
+        final name = _asString(raw['name']).trim();
+        final id = _asInt(raw['id'] ?? raw['catid'] ?? raw['category_id'] ?? raw['categoryId']);
+        if (id > 0 && _isVisibleCategory(name)) {
+          out.add(NewsCategoryEntry(id: id, name: name));
+        }
+      }
+    }
+    return out;
   }
 
   Future<List<NewsItem>> fetchFeatured() async {
@@ -224,35 +302,8 @@ class NewsApiService {
   }
 
   Future<List<String>> fetchCategories() async {
-    final uri = Uri.parse('$_apiBaseUrl/categories.php?rootId=$_defaultCatId');
-    final response = await http.get(uri).timeout(
-      const Duration(seconds: 12),
-      onTimeout: () => throw Exception('API timeout. Check endpoint URL and server.'),
-    );
-    if (response.statusCode != 200) {
-      throw Exception('Failed to load categories: ${response.statusCode}');
-    }
-
-    final dynamic decoded = jsonDecode(response.body);
-    final map = _extractResponseMap(decoded);
-    if ((map['ok'] as bool?) == false) {
-      throw Exception(_asString(map['error'], fallback: 'Categories request failed'));
-    }
-
-    final dynamic items = map['items'];
-    if (items is! List) {
-      return <String>[];
-    }
-    final categories = <String>[];
-    for (final raw in items) {
-      if (raw is Map<String, dynamic>) {
-        final name = _asString(raw['name']).trim();
-        if (_isVisibleCategory(name)) {
-          categories.add(name);
-        }
-      }
-    }
-    return categories;
+    final entries = await fetchCategoryEntries();
+    return entries.map((e) => e.name).toList();
   }
 }
 
@@ -460,6 +511,7 @@ class _AppShellPageState extends State<AppShellPage> {
   Widget build(BuildContext context) {
     final pages = <Widget>[
       NewsListPage(
+        key: const ValueKey<String>('news_home'),
         isDiscoverMode: false,
         onViewAllTap: () => setState(() => _selectedTab = 1),
         savedIds: _savedIds,
@@ -477,6 +529,7 @@ class _AppShellPageState extends State<AppShellPage> {
         },
       ),
       NewsListPage(
+        key: const ValueKey<String>('news_discover'),
         isDiscoverMode: true,
         savedIds: _savedIds,
         onToggleSaved: _toggleSaved,
@@ -511,7 +564,14 @@ class _AppShellPageState extends State<AppShellPage> {
           ? null
           : _BottomNavBar(
               selectedIndex: _selectedTab,
-              onSelect: (value) => setState(() => _selectedTab = value),
+              onSelect: (value) => setState(() {
+                // Category chosen from the home menu is one-time.
+                // When user returns to Discover via bottom nav, reset to "Все".
+                if (value == 1 && _selectedTab != 1) {
+                  _discoverSelectedCategory = 'Все';
+                }
+                _selectedTab = value;
+              }),
             ),
     );
   }
@@ -549,13 +609,40 @@ class NewsListPage extends StatefulWidget {
 
 class _NewsListPageState extends State<NewsListPage> {
   final NewsApiService _api = NewsApiService();
-  late Future<_FeedData> _feedFuture;
   final TextEditingController _searchController = TextEditingController();
+
+  bool _initialLoading = true;
+  Object? _loadError;
+  final List<NewsItem> _news = <NewsItem>[];
+  List<NewsItem> _featured = <NewsItem>[];
+  List<String> _categories = <String>[];
+  List<NewsCategoryEntry> _categoryEntries = <NewsCategoryEntry>[];
+  final Map<int, List<NewsItem>> _categoryNewsCache = <int, List<NewsItem>>{};
+  final Map<int, int> _categoryNextPageCache = <int, int>{};
+  final Map<int, bool> _categoryHasMoreCache = <int, bool>{};
+  /// API category id for the list we are paginating (home = root; discover = chip).
+  int _listCategoryId = NewsApiService.kRootCategoryId;
+  String _discoverSelectedLabel = 'Все';
+  bool _discoverSwitching = false;
+  int _nextPage = 2;
+  bool _hasMore = true;
+  bool _loadingMore = false;
 
   @override
   void initState() {
     super.initState();
-    _feedFuture = _loadFeed();
+    _discoverSelectedLabel = widget.initialDiscoverCategory;
+    _bootstrap();
+  }
+
+  @override
+  void didUpdateWidget(covariant NewsListPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isDiscoverMode &&
+        oldWidget.initialDiscoverCategory != widget.initialDiscoverCategory) {
+      _discoverSelectedLabel = widget.initialDiscoverCategory;
+      _applyDiscoverCategory(widget.initialDiscoverCategory);
+    }
   }
 
   @override
@@ -564,111 +651,399 @@ class _NewsListPageState extends State<NewsListPage> {
     super.dispose();
   }
 
-  Future<void> _reload() async {
-    setState(() {
-      _feedFuture = _loadFeed();
-    });
-    await _feedFuture;
+  int _resolveCategoryId(String label) {
+    if (label == 'Все') {
+      return NewsApiService.kRootCategoryId;
+    }
+    for (final e in _categoryEntries) {
+      if (e.name == label) {
+        return e.id;
+      }
+    }
+    return NewsApiService.kRootCategoryId;
   }
 
-  Future<_FeedData> _loadFeed() async {
-    final news = await _api.fetchNews();
-
-    List<NewsItem> featured = <NewsItem>[];
+  Future<void> _bootstrap() async {
+    setState(() {
+      _initialLoading = true;
+      _loadError = null;
+    });
     try {
-      featured = await _api.fetchFeatured();
-    } catch (_) {
-      // Keep home feed usable even if featured endpoint temporarily fails.
-      featured = <NewsItem>[];
-    }
+      List<NewsCategoryEntry> entries = <NewsCategoryEntry>[];
+      try {
+        entries = await _api.fetchCategoryEntries();
+      } catch (_) {
+        entries = <NewsCategoryEntry>[];
+      }
 
-    List<String> categories = <String>[];
+      if (widget.isDiscoverMode) {
+        final label = widget.initialDiscoverCategory;
+        final catId =
+            entries.isEmpty ? NewsApiService.kRootCategoryId : NewsCategoryEntry.apiIdForLabel(label, entries);
+        final news = await _api.fetchNewsPage(1, categoryId: catId);
+
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _categoryEntries = entries;
+          _categories = entries.map((e) => e.name).toList();
+          _discoverSelectedLabel = label;
+          _listCategoryId = catId;
+          _news
+            ..clear()
+            ..addAll(news);
+          _featured = <NewsItem>[];
+          _hasMore = news.length >= NewsApiService.kNewsPageSize;
+          _nextPage = 2;
+          _categoryNewsCache[catId] = List<NewsItem>.from(news);
+          _categoryHasMoreCache[catId] = _hasMore;
+          _categoryNextPageCache[catId] = _nextPage;
+          _initialLoading = false;
+        });
+        return;
+      }
+
+      final news = await _api.fetchNewsPage(1, categoryId: NewsApiService.kRootCategoryId);
+
+      List<NewsItem> featured = <NewsItem>[];
+      try {
+        featured = await _api.fetchFeatured();
+      } catch (_) {
+        featured = <NewsItem>[];
+      }
+
+      List<String> categories = <String>[];
+      if (entries.isNotEmpty) {
+        categories = entries.map((e) => e.name).toList();
+      } else {
+        try {
+          categories = await _api.fetchCategories();
+        } catch (_) {
+          categories = news
+              .map((item) => item.category.trim())
+              .where(_isVisibleCategory)
+              .toSet()
+              .toList();
+        }
+      }
+
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _categoryEntries = entries;
+        _listCategoryId = NewsApiService.kRootCategoryId;
+        _news
+          ..clear()
+          ..addAll(news);
+        _featured = featured;
+        _categories = categories;
+        _hasMore = news.length >= NewsApiService.kNewsPageSize;
+        _nextPage = 2;
+        _initialLoading = false;
+      });
+    } catch (e, st) {
+      debugPrint('Feed bootstrap failed: $e\n$st');
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _loadError = e;
+        _initialLoading = false;
+      });
+    }
+  }
+
+  Future<void> _applyDiscoverCategory(String label) async {
+    if (!widget.isDiscoverMode) {
+      return;
+    }
+    if (_discoverSwitching) {
+      return;
+    }
+    final catId = _resolveCategoryId(label);
+    if (catId == _listCategoryId && label == _discoverSelectedLabel && _news.isNotEmpty) {
+      return;
+    }
+    final cachedNews = _categoryNewsCache[catId];
+    final cachedHasMore = _categoryHasMoreCache[catId];
+    final cachedNextPage = _categoryNextPageCache[catId];
+    if (cachedNews != null) {
+      setState(() {
+        _discoverSelectedLabel = label;
+        _listCategoryId = catId;
+        _news
+          ..clear()
+          ..addAll(cachedNews);
+        _hasMore = cachedHasMore ?? true;
+        _nextPage = cachedNextPage ?? 2;
+      });
+      return;
+    }
+    setState(() {
+      _discoverSwitching = true;
+      _discoverSelectedLabel = label;
+    });
     try {
-      categories = await _api.fetchCategories();
-    } catch (_) {
-      categories = news
-          .map((item) => item.category.trim())
-          .where(_isVisibleCategory)
-          .toSet()
-          .toList();
+      final news = await _api.fetchNewsPage(1, categoryId: catId);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _listCategoryId = catId;
+        _news
+          ..clear()
+          ..addAll(news);
+        _hasMore = news.length >= NewsApiService.kNewsPageSize;
+        _nextPage = 2;
+        _categoryNewsCache[catId] = List<NewsItem>.from(news);
+        _categoryHasMoreCache[catId] = _hasMore;
+        _categoryNextPageCache[catId] = _nextPage;
+        _discoverSwitching = false;
+      });
+    } catch (e, st) {
+      debugPrint('Discover category load failed: $e\n$st');
+      if (mounted) {
+        setState(() => _discoverSwitching = false);
+      }
     }
+  }
 
-    return _FeedData(
-      news: news,
-      featured: featured,
-      categories: categories,
-    );
+  Future<void> _reload() async {
+    try {
+      List<NewsCategoryEntry> entries = _categoryEntries;
+      if (entries.isEmpty) {
+        try {
+          entries = await _api.fetchCategoryEntries();
+        } catch (_) {
+          entries = <NewsCategoryEntry>[];
+        }
+      }
+
+      if (widget.isDiscoverMode) {
+        final catId = _resolveCategoryId(_discoverSelectedLabel);
+        final news = await _api.fetchNewsPage(1, categoryId: catId);
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _categoryEntries = entries;
+          _categories = entries.map((e) => e.name).toList();
+          _listCategoryId = catId;
+          _news
+            ..clear()
+            ..addAll(news);
+          _hasMore = news.length >= NewsApiService.kNewsPageSize;
+          _nextPage = 2;
+          _categoryNewsCache[catId] = List<NewsItem>.from(news);
+          _categoryHasMoreCache[catId] = _hasMore;
+          _categoryNextPageCache[catId] = _nextPage;
+          _loadError = null;
+        });
+        return;
+      }
+
+      final news = await _api.fetchNewsPage(1, categoryId: NewsApiService.kRootCategoryId);
+
+      List<NewsItem> featured = <NewsItem>[];
+      try {
+        featured = await _api.fetchFeatured();
+      } catch (_) {
+        featured = <NewsItem>[];
+      }
+
+      List<String> categories = <String>[];
+      if (entries.isNotEmpty) {
+        categories = entries.map((e) => e.name).toList();
+      } else {
+        try {
+          categories = await _api.fetchCategories();
+        } catch (_) {
+          categories = news
+              .map((item) => item.category.trim())
+              .where(_isVisibleCategory)
+              .toSet()
+              .toList();
+        }
+      }
+
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _categoryEntries = entries;
+        _listCategoryId = NewsApiService.kRootCategoryId;
+        _news
+          ..clear()
+          ..addAll(news);
+        _featured = featured;
+        _categories = categories;
+        _hasMore = news.length >= NewsApiService.kNewsPageSize;
+        _nextPage = 2;
+        _loadError = null;
+      });
+    } catch (e, st) {
+      debugPrint('Feed refresh failed: $e\n$st');
+      if (mounted) {
+        setState(() => _loadError = e);
+      }
+    }
+  }
+
+  void _appendUnique(List<NewsItem> batch) {
+    final seen = _news.map((e) => e.id).toSet();
+    for (final item in batch) {
+      if (seen.add(item.id)) {
+        _news.add(item);
+      }
+    }
+  }
+
+  Future<void> _loadMore() async {
+    if (_initialLoading || !_hasMore || _loadingMore || _loadError != null) {
+      return;
+    }
+    setState(() => _loadingMore = true);
+    try {
+      final batch = await _api.fetchNewsPage(_nextPage, categoryId: _listCategoryId);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _appendUnique(batch);
+        _hasMore = batch.length >= NewsApiService.kNewsPageSize;
+        _nextPage++;
+        _categoryNewsCache[_listCategoryId] = List<NewsItem>.from(_news);
+        _categoryHasMoreCache[_listCategoryId] = _hasMore;
+        _categoryNextPageCache[_listCategoryId] = _nextPage;
+      });
+    } catch (e, st) {
+      debugPrint('Feed load more failed: $e\n$st');
+    } finally {
+      if (mounted) {
+        setState(() => _loadingMore = false);
+      }
+    }
+  }
+
+  bool _onScrollNotification(ScrollNotification n) {
+    if (n.metrics.axis != Axis.vertical) {
+      return false;
+    }
+    if (!_hasMore || _loadingMore || _initialLoading) {
+      return false;
+    }
+    final m = n.metrics;
+    if (!m.hasViewportDimension || !m.hasPixels) {
+      return false;
+    }
+    if (m.extentAfter < 320) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          _loadMore();
+        }
+      });
+    }
+    return false;
   }
 
   @override
   Widget build(BuildContext context) {
+    if (_initialLoading) {
+      return const SafeArea(
+        child: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    if (_loadError != null) {
+      return SafeArea(
+        child: RefreshIndicator(
+          onRefresh: () async {
+            setState(() => _loadError = null);
+            await _bootstrap();
+          },
+          child: ListView(
+            physics: const AlwaysScrollableScrollPhysics(),
+            children: [
+              const SizedBox(height: 180),
+              Icon(Icons.error_outline, size: 48, color: Colors.red.shade400),
+              const SizedBox(height: 12),
+              Center(
+                child: Text(
+                  'Не удалось загрузить новости.\n$_loadError',
+                  textAlign: TextAlign.center,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (widget.isDiscoverMode) {
+      return SafeArea(
+        child: RefreshIndicator(
+          onRefresh: _reload,
+          child: NotificationListener<ScrollNotification>(
+            onNotification: _onScrollNotification,
+            child: _DiscoverView(
+              news: _news,
+              onOpen: _openDetails,
+              categories: _categories,
+              selectedCategory: _discoverSelectedLabel,
+              onCategorySelected: _applyDiscoverCategory,
+              isLoadingMore: _loadingMore,
+              hasMore: _hasMore,
+              switching: _discoverSwitching,
+            ),
+          ),
+        ),
+      );
+    }
+
+    if (_news.isEmpty) {
+      return SafeArea(
+        child: RefreshIndicator(
+          onRefresh: _reload,
+          child: ListView(
+            physics: const AlwaysScrollableScrollPhysics(),
+            children: const [
+              SizedBox(height: 180),
+              Center(child: Text('Пока нет новостей')),
+            ],
+          ),
+        ),
+      );
+    }
+
     return SafeArea(
       child: RefreshIndicator(
         onRefresh: _reload,
-        child: FutureBuilder<_FeedData>(
-          future: _feedFuture,
-          builder: (context, snapshot) {
-            if (snapshot.connectionState == ConnectionState.waiting) {
-              return const Center(child: CircularProgressIndicator());
-            }
-
-            if (snapshot.hasError) {
-              return ListView(
-                physics: const AlwaysScrollableScrollPhysics(),
-                children: [
-                  const SizedBox(height: 180),
-                  Icon(Icons.error_outline, size: 48, color: Colors.red.shade400),
-                  const SizedBox(height: 12),
-                  Center(
-                    child: Text(
-                      'Не удалось загрузить новости.\n${snapshot.error}',
-                      textAlign: TextAlign.center,
-                    ),
-                  ),
-                ],
-              );
-            }
-
-            final data = snapshot.data ?? const _FeedData(news: [], featured: [], categories: []);
-            final news = data.news;
-            if (news.isEmpty) {
-              return ListView(
-                physics: const AlwaysScrollableScrollPhysics(),
-                children: const [
-                  SizedBox(height: 180),
-                  Center(child: Text('Пока нет новостей')),
-                ],
-              );
-            }
-
-            return widget.isDiscoverMode
-                ? _DiscoverView(
-                    news: news,
-                    onOpen: _openDetails,
-                    categories: data.categories,
-                    initialCategory: widget.initialDiscoverCategory,
-                  )
-                : Stack(
-                    children: [
-                      _HomeView(
-                        news: news,
-                        featured: data.featured,
-                        onOpen: _openDetails,
-                        onViewAllTap: widget.onViewAllTap,
-                        isDarkTheme: widget.isDarkTheme,
-                        onToggleTheme: widget.onToggleTheme,
-                        isMenuOpen: widget.isMenuOpen,
-                        onMenuTap: () => widget.onMenuOpenChanged?.call(!widget.isMenuOpen),
-                      ),
-                      _FullScreenMenu(
-                        isOpen: widget.isMenuOpen,
-                        onClose: () => widget.onMenuOpenChanged?.call(false),
-                        onCategoryTap: (category) => widget.onMenuCategoryTap?.call(category),
-                        categories: data.categories,
-                      ),
-                    ],
-                  );
-          },
+        child: NotificationListener<ScrollNotification>(
+          onNotification: _onScrollNotification,
+          child: Stack(
+            children: [
+              _HomeView(
+                news: _news,
+                featured: _featured,
+                onOpen: _openDetails,
+                onViewAllTap: widget.onViewAllTap,
+                isDarkTheme: widget.isDarkTheme,
+                onToggleTheme: widget.onToggleTheme,
+                isMenuOpen: widget.isMenuOpen,
+                onMenuTap: () => widget.onMenuOpenChanged?.call(!widget.isMenuOpen),
+                isLoadingMore: _loadingMore,
+                hasMoreNews: _hasMore,
+              ),
+              _FullScreenMenu(
+                isOpen: widget.isMenuOpen,
+                onClose: () => widget.onMenuOpenChanged?.call(false),
+                onCategoryTap: (category) => widget.onMenuCategoryTap?.call(category),
+                categories: _categories,
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -690,6 +1065,52 @@ class _NewsListPageState extends State<NewsListPage> {
   }
 }
 
+class _LoadMoreFooter extends StatelessWidget {
+  const _LoadMoreFooter({required this.visible, required this.showSpinner});
+
+  final bool visible;
+  final bool showSpinner;
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 280),
+      switchInCurve: Curves.easeOut,
+      switchOutCurve: Curves.easeIn,
+      child: !visible
+          ? const SizedBox.shrink(key: ValueKey<String>('load-footer-off'))
+          : Padding(
+              key: const ValueKey<String>('load-footer-on'),
+              padding: const EdgeInsets.fromLTRB(16, 20, 16, 28),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  if (showSpinner) ...[
+                    SizedBox(
+                      width: 22,
+                      height: 22,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2.2,
+                        color: isDark ? const Color(0xFF8C95A3) : const Color(0xFF2E80F9),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                  ],
+                  Text(
+                    showSpinner ? 'Загружаем новости…' : 'Вы дошли до конца ленты',
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          color: isDark ? const Color(0xFF9AA3B3) : const Color(0xFF6E6E73),
+                          fontWeight: FontWeight.w500,
+                        ),
+                  ),
+                ],
+              ),
+            ),
+    );
+  }
+}
+
 class _HomeView extends StatelessWidget {
   const _HomeView({
     required this.news,
@@ -700,6 +1121,8 @@ class _HomeView extends StatelessWidget {
     required this.onToggleTheme,
     required this.isMenuOpen,
     required this.onMenuTap,
+    this.isLoadingMore = false,
+    this.hasMoreNews = true,
   });
 
   final List<NewsItem> news;
@@ -710,6 +1133,8 @@ class _HomeView extends StatelessWidget {
   final VoidCallback onToggleTheme;
   final bool isMenuOpen;
   final VoidCallback onMenuTap;
+  final bool isLoadingMore;
+  final bool hasMoreNews;
 
   @override
   Widget build(BuildContext context) {
@@ -717,42 +1142,40 @@ class _HomeView extends StatelessWidget {
     final rest = news;
 
     return ListView(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      padding: const EdgeInsets.symmetric(vertical: 12),
       children: [
-        _TopBar(
-          isMenuOpen: isMenuOpen,
-          onMenuTap: onMenuTap,
-          isDarkTheme: isDarkTheme,
-          onToggleTheme: onToggleTheme,
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: _TopBar(
+            isMenuOpen: isMenuOpen,
+            onMenuTap: onMenuTap,
+            isDarkTheme: isDarkTheme,
+            onToggleTheme: onToggleTheme,
+          ),
         ),
         const SizedBox(height: 18),
-        _SectionHeader(title: 'Главные новости', onTapAll: onViewAllTap),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: _SectionHeader(title: 'Главные новости', onTapAll: onViewAllTap),
+        ),
         const SizedBox(height: 12),
         _BreakingCarousel(items: top, onOpen: onOpen),
         const SizedBox(height: 18),
-        _SectionHeader(title: 'Лента новостей', onTapAll: onViewAllTap),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: _SectionHeader(title: 'Лента новостей', onTapAll: onViewAllTap),
+        ),
         const SizedBox(height: 8),
         ...rest.map(
           (item) => Padding(
-            padding: const EdgeInsets.only(bottom: 10),
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
             child: _FeedRow(item: item, onTap: () => onOpen(item)),
           ),
         ),
+        _LoadMoreFooter(visible: isLoadingMore || !hasMoreNews, showSpinner: isLoadingMore),
       ],
     );
   }
-}
-
-class _FeedData {
-  const _FeedData({
-    required this.news,
-    required this.featured,
-    required this.categories,
-  });
-
-  final List<NewsItem> news;
-  final List<NewsItem> featured;
-  final List<String> categories;
 }
 
 class _BreakingCarousel extends StatefulWidget {
@@ -776,7 +1199,7 @@ class _BreakingCarouselState extends State<_BreakingCarousel> {
     final count = widget.items.isEmpty ? 1 : widget.items.length;
     _virtualPage = _kLoopBase * count;
     _pageController = PageController(
-      viewportFraction: 0.84,
+      viewportFraction: 0.86,
       initialPage: _virtualPage,
     );
   }
@@ -872,76 +1295,81 @@ class _BreakingCarouselState extends State<_BreakingCarousel> {
   }
 }
 
-class _DiscoverView extends StatefulWidget {
+class _DiscoverView extends StatelessWidget {
   const _DiscoverView({
     required this.news,
     required this.onOpen,
     required this.categories,
-    required this.initialCategory,
+    required this.selectedCategory,
+    required this.onCategorySelected,
+    this.isLoadingMore = false,
+    this.hasMore = true,
+    this.switching = false,
   });
 
   final List<NewsItem> news;
   final ValueChanged<NewsItem> onOpen;
   final List<String> categories;
-  final String initialCategory;
-
-  @override
-  State<_DiscoverView> createState() => _DiscoverViewState();
-}
-
-class _DiscoverViewState extends State<_DiscoverView> {
-  String _selectedCategory = 'Все';
-
-  @override
-  void initState() {
-    super.initState();
-    _selectedCategory = widget.initialCategory;
-  }
-
-  @override
-  void didUpdateWidget(covariant _DiscoverView oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.initialCategory != widget.initialCategory) {
-      _selectedCategory = widget.initialCategory;
-    }
-  }
+  final String selectedCategory;
+  final ValueChanged<String> onCategorySelected;
+  final bool isLoadingMore;
+  final bool hasMore;
+  final bool switching;
 
   @override
   Widget build(BuildContext context) {
-    final categories = <String>['Все', ...widget.categories];
-    if (!categories.contains(_selectedCategory)) {
-      _selectedCategory = 'Все';
-    }
-    final filtered = _selectedCategory == 'Все'
-        ? widget.news
-        : widget.news.where((e) => e.category == _selectedCategory).toList();
+    final chipLabels = <String>['Все', ...categories];
+    final effectiveCategory =
+        chipLabels.contains(selectedCategory) ? selectedCategory : 'Все';
 
     return ListView(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       children: [
+        if (switching)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: const LinearProgressIndicator(minHeight: 3),
+            ),
+          ),
         Text('Лента новостей', style: Theme.of(context).textTheme.headlineMedium),
         const SizedBox(height: 12),
         SizedBox(
           height: 36,
           child: ListView(
             scrollDirection: Axis.horizontal,
-            children: categories
+            children: chipLabels
                 .map(
                   (cat) => _TopicChip(
                     label: cat,
-                    selected: _selectedCategory == cat,
-                    onTap: () => setState(() => _selectedCategory = cat),
+                    selected: effectiveCategory == cat,
+                    onTap: () => onCategorySelected(cat),
                   ),
                 )
                 .toList(),
           ),
         ),
         const SizedBox(height: 12),
-        ...filtered.map(
-          (item) => Padding(
-            padding: const EdgeInsets.only(bottom: 10),
-            child: _FeedRow(item: item, onTap: () => widget.onOpen(item)),
+        if (news.isEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 24),
+            child: Text(
+              effectiveCategory == 'Все' ? 'Пока нет новостей' : 'В этой категории пока нет материалов.',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodyLarge,
+            ),
+          )
+        else
+          ...news.map(
+            (item) => Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: _FeedRow(item: item, onTap: () => onOpen(item)),
+            ),
           ),
+        _LoadMoreFooter(
+          visible: isLoadingMore || !hasMore,
+          showSpinner: isLoadingMore,
         ),
       ],
     );
@@ -962,15 +1390,18 @@ class _SavedView extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (items.isEmpty) {
-      return const Center(
-        child: Text('В избранном пока пусто'),
+      return const SafeArea(
+        child: Center(
+          child: Text('В избранном пока пусто'),
+        ),
       );
     }
 
-    return ListView(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      children: [
-        Text('Избранное', style: Theme.of(context).textTheme.headlineMedium),
+    return SafeArea(
+      child: ListView(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        children: [
+          Text('Избранное', style: Theme.of(context).textTheme.headlineMedium),
         const SizedBox(height: 12),
         ...items.map(
           (item) => Padding(
@@ -986,6 +1417,7 @@ class _SavedView extends StatelessWidget {
           ),
         ),
       ],
+      ),
     );
   }
 }
@@ -1045,50 +1477,38 @@ class _BottomNavBar extends StatelessWidget {
                       color: selected ? const Color(0xFF2E80F9) : Colors.transparent,
                       borderRadius: BorderRadius.circular(20),
                     ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      crossAxisAlignment: CrossAxisAlignment.center,
-                      children: [
-                        AnimatedScale(
-                          duration: const Duration(milliseconds: 180),
-                          scale: selected ? 1.05 : 0.95,
-                          curve: Curves.easeOutBack,
-                          child: Icon(
-                            item.$1,
-                            size: 22,
-                            color: selected
-                                ? Colors.white
-                                : (isDark ? const Color(0xFF8C95A3) : Colors.black38),
+                    child: AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 180),
+                      switchInCurve: Curves.easeOut,
+                      switchOutCurve: Curves.easeOut,
+                      transitionBuilder: (child, animation) {
+                        return FadeTransition(
+                          opacity: animation,
+                          child: ScaleTransition(
+                            scale: Tween<double>(begin: 0.92, end: 1).animate(animation),
+                            child: child,
                           ),
-                        ),
-                        TweenAnimationBuilder<double>(
-                          duration: const Duration(milliseconds: 180),
-                          curve: Curves.easeOut,
-                          tween: Tween<double>(begin: 0, end: selected ? 1 : 0),
-                          builder: (context, value, child) {
-                            return ClipRect(
-                              child: Align(
-                                alignment: Alignment.centerLeft,
-                                widthFactor: value,
-                                child: Opacity(opacity: value, child: child),
-                              ),
-                            );
-                          },
-                          child: Padding(
-                            padding: const EdgeInsets.only(left: 8),
-                            child: Text(
+                        );
+                      },
+                      child: selected
+                          ? Text(
                               item.$2,
+                              key: ValueKey<String>('nav-label-$index'),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
                               style: const TextStyle(
                                 color: Colors.white,
                                 fontWeight: FontWeight.w500,
                                 fontSize: 14,
                                 height: 1.0,
                               ),
+                            )
+                          : Icon(
+                              item.$1,
+                              key: ValueKey<String>('nav-icon-$index'),
+                              size: 22,
+                              color: isDark ? const Color(0xFF8C95A3) : Colors.black38,
                             ),
-                          ),
-                        ),
-                      ],
                     ),
                   ),
                 ),
@@ -1112,16 +1532,17 @@ class _InfoView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(20, 20, 20, 24),
-      children: [
-        Center(
-          child: SvgPicture.asset(
-            isDarkTheme ? 'assets/tinfo_logo_dark.svg' : 'assets/tinfo_logo.svg',
-            width: 360,
-            height: 88,
+    return SafeArea(
+      child: ListView(
+        padding: const EdgeInsets.fromLTRB(20, 20, 20, 24),
+        children: [
+          Center(
+            child: SvgPicture.asset(
+              isDarkTheme ? 'assets/tinfo_logo_dark.svg' : 'assets/tinfo_logo.svg',
+              width: 360,
+              height: 88,
+            ),
           ),
-        ),
         const SizedBox(height: 22),
         Text(
           'О tinfo.kz',
@@ -1158,6 +1579,7 @@ class _InfoView extends StatelessWidget {
           onToggleTheme: onToggleTheme,
         ),
       ],
+      ),
     );
   }
 }
@@ -1501,7 +1923,7 @@ class _HeroNewsCard extends StatelessWidget {
       borderRadius: BorderRadius.circular(24),
       onTap: onTap,
       child: Container(
-        width: 320,
+        width: double.infinity,
         decoration: BoxDecoration(
           borderRadius: BorderRadius.circular(24),
           color: item.imageUrl == null ? Colors.black87 : null,
@@ -1549,7 +1971,7 @@ class _HeroNewsCard extends StatelessWidget {
                   const SizedBox(height: 6),
                   Text(
                     item.title,
-                    maxLines: 2,
+                    maxLines: 3,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
                       color: Colors.white,
@@ -1885,176 +2307,165 @@ class _NewsDetailsPageState extends State<NewsDetailsPage> {
           return CustomScrollView(
             controller: _scrollController,
             slivers: [
-              SliverAppBar(
-                expandedHeight: 420,
-                pinned: false,
-                leading: const SizedBox.shrink(),
-                leadingWidth: 0,
-                flexibleSpace: FlexibleSpaceBar(
-                  background: Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      article.imageUrl == null
-                          ? Container(color: Colors.black87)
-                          : _ResilientNetworkImage(
-                              url: article.imageUrl!,
-                              fit: BoxFit.cover,
-                              preferredSize: _NewsImageSize.large,
-                            ),
-                      Container(
-                        decoration: const BoxDecoration(
-                          gradient: LinearGradient(
-                            begin: Alignment.topCenter,
-                            end: Alignment.bottomCenter,
-                            colors: [Color(0x10000000), Color(0xE6000000)],
-                          ),
-                        ),
-                      ),
-                      Positioned.fill(
-                        child: IgnorePointer(
-                          child: BackdropFilter(
-                            filter: ImageFilter.blur(
-                              sigmaX: _heroBlurSigma,
-                              sigmaY: _heroBlurSigma,
-                            ),
-                            child: AnimatedContainer(
-                              duration: const Duration(milliseconds: 120),
-                              color: Colors.black.withValues(alpha: _heroDimOpacity),
-                            ),
-                          ),
-                        ),
-                      ),
-                      Positioned(
-                        top: MediaQuery.of(context).padding.top + 10,
-                        left: 16,
-                        right: 16,
-                        child: Row(
-                          children: [
-                            _GlassCircleIconButton(
-                              icon: Icons.arrow_back_ios_new_rounded,
-                              onTap: () => Navigator.of(context).maybePop(),
-                            ),
-                            const Spacer(),
-                            _GlassCircleIconButton(
-                              icon: _isSavedLocal ? Icons.bookmark : Icons.bookmark_border,
-                              onTap: () {
-                                setState(() => _isSavedLocal = !_isSavedLocal);
-                                widget.onToggleSaved();
-                              },
-                            ),
-                            const SizedBox(width: 10),
-                            _GlassCircleIconButton(
-                              icon: Icons.share_outlined,
-                              onTap: () {
-                                final shareText =
-                                    '${article.title}\n\nhttps://www.tinfo.kz\n\n${_formatDateFromSource(article)}';
-                                SharePlus.instance.share(
-                                  ShareParams(
-                                    text: shareText,
-                                    subject: article.title,
-                                  ),
-                                );
-                              },
-                            ),
-                          ],
-                        ),
-                      ),
-                      Positioned(
-                        left: 20,
-                        right: 20,
-                        bottom: 52,
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            _TagPill(text: article.category.isEmpty ? 'Новости' : article.category),
-                            const SizedBox(height: 12),
-                            Text(
-                              article.title,
-                              maxLines: 5,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontWeight: FontWeight.w500,
-                                fontSize: 23,
-                                height: 1.2,
-                              ),
-                            ),
-                            const SizedBox(height: 8),
-                            Text(
-                              _formatDateFromSource(article),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                color: Color(0xE6FFFFFF),
-                                fontSize: 13,
-                                fontWeight: FontWeight.w400,
-                              ),
-                            ),
-                            const SizedBox(height: 4),
-                          ],
-                        ),
-                      ),
-                      Positioned(
-                        left: 0,
-                        right: 0,
-                        bottom: -1,
-                        child: AnimatedContainer(
-                          duration: const Duration(milliseconds: 180),
-                          curve: Curves.easeOut,
-                          height: 18,
-                          decoration: BoxDecoration(
-                            color: isDark ? const Color(0xFF101825) : Colors.white,
-                            borderRadius: BorderRadius.vertical(top: Radius.circular(_topRadius)),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
+              // Hero + article in one sliver so overlap + rounded top are not clipped at the
+              // boundary between SliverAppBar and the next sliver (Web + iOS).
               SliverToBoxAdapter(
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 180),
-                  curve: Curves.easeOut,
-                  decoration: BoxDecoration(
-                    color: isDark ? const Color(0xFF101825) : Colors.white,
-                    borderRadius: BorderRadius.vertical(top: Radius.circular(_topRadius)),
-                  ),
-                  clipBehavior: Clip.antiAlias,
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(20, 10, 20, 16),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        if (snapshot.hasError)
-                          const Padding(
-                            padding: EdgeInsets.only(bottom: 12),
-                            child: Text(
-                              'Полный текст временно недоступен, показана краткая версия.',
-                              style: TextStyle(color: Colors.redAccent),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    SizedBox(
+                      height: 420,
+                      child: Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          article.imageUrl == null
+                              ? Container(color: Colors.black87)
+                              : _ResilientNetworkImage(
+                                  url: article.imageUrl!,
+                                  fit: BoxFit.cover,
+                                  preferredSize: _NewsImageSize.large,
+                                ),
+                          Container(
+                            decoration: const BoxDecoration(
+                              gradient: LinearGradient(
+                                begin: Alignment.topCenter,
+                                end: Alignment.bottomCenter,
+                                colors: [Color(0x10000000), Color(0xE6000000)],
+                              ),
                             ),
                           ),
-                        Html(
-                          data: article.contentHtml.isEmpty ? article.summaryHtml : article.contentHtml,
-                          style: {
-                            'body': Style(
-                              margin: Margins.zero,
-                              padding: HtmlPaddings.zero,
-                              fontSize: FontSize(16),
-                              lineHeight: const LineHeight(1.3),
-                              color: isDark ? const Color(0xFFEAF0F8) : Colors.black,
+                          Positioned.fill(
+                            child: IgnorePointer(
+                              child: BackdropFilter(
+                                filter: ImageFilter.blur(
+                                  sigmaX: _heroBlurSigma,
+                                  sigmaY: _heroBlurSigma,
+                                ),
+                                child: AnimatedContainer(
+                                  duration: const Duration(milliseconds: 120),
+                                  color: Colors.black.withValues(alpha: _heroDimOpacity),
+                                ),
+                              ),
                             ),
-                            'p': Style(
-                              margin: Margins.only(bottom: 12),
-                              fontSize: FontSize(16),
-                              lineHeight: const LineHeight(1.3),
-                              color: isDark ? const Color(0xFFEAF0F8) : Colors.black,
+                          ),
+                          Positioned(
+                            top: MediaQuery.of(context).padding.top + 10,
+                            left: 16,
+                            right: 16,
+                            child: Row(
+                              children: [
+                                _GlassCircleIconButton(
+                                  icon: Icons.arrow_back_ios_new_rounded,
+                                  onTap: () => Navigator.of(context).maybePop(),
+                                ),
+                                const Spacer(),
+                                _GlassCircleIconButton(
+                                  icon: _isSavedLocal ? Icons.bookmark : Icons.bookmark_border,
+                                  onTap: () {
+                                    setState(() => _isSavedLocal = !_isSavedLocal);
+                                    widget.onToggleSaved();
+                                  },
+                                ),
+                                const SizedBox(width: 10),
+                                _GlassCircleIconButton(
+                                  icon: Icons.share_outlined,
+                                  onTap: () {
+                                    final shareText =
+                                        '${article.title}\n\nhttps://www.tinfo.kz\n\n${_formatDateFromSource(article)}';
+                                    SharePlus.instance.share(
+                                      ShareParams(
+                                        text: shareText,
+                                        subject: article.title,
+                                      ),
+                                    );
+                                  },
+                                ),
+                              ],
                             ),
-                          },
-                        ),
-                      ],
+                          ),
+                          Positioned(
+                            left: 20,
+                            right: 20,
+                            bottom: 52,
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                _TagPill(text: article.category.isEmpty ? 'Новости' : article.category),
+                                const SizedBox(height: 12),
+                                Text(
+                                  article.title,
+                                  maxLines: 5,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w500,
+                                    fontSize: 23,
+                                    height: 1.2,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                Text(
+                                  _formatDateFromSource(article),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: Color(0xE6FFFFFF),
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w400,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
-                  ),
+                    Transform.translate(
+                      offset: const Offset(0, -28),
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.vertical(top: Radius.circular(_topRadius)),
+                        clipBehavior: Clip.antiAlias,
+                        child: ColoredBox(
+                          color: isDark ? const Color(0xFF101825) : Colors.white,
+                          child: Padding(
+                            padding: const EdgeInsets.fromLTRB(20, 36, 20, 20),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                if (snapshot.hasError)
+                                  const Padding(
+                                    padding: EdgeInsets.only(bottom: 12),
+                                    child: Text(
+                                      'Полный текст временно недоступен, показана краткая версия.',
+                                      style: TextStyle(color: Colors.redAccent),
+                                    ),
+                                  ),
+                                Html(
+                                  data: article.contentHtml.isEmpty ? article.summaryHtml : article.contentHtml,
+                                  style: {
+                                    'body': Style(
+                                      margin: Margins.zero,
+                                      padding: HtmlPaddings.zero,
+                                      fontSize: FontSize(16),
+                                      lineHeight: const LineHeight(1.3),
+                                      color: isDark ? const Color(0xFFEAF0F8) : Colors.black,
+                                    ),
+                                    'p': Style(
+                                      margin: Margins.only(bottom: 12),
+                                      fontSize: FontSize(16),
+                                      lineHeight: const LineHeight(1.3),
+                                      color: isDark ? const Color(0xFFEAF0F8) : Colors.black,
+                                    ),
+                                  },
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ],

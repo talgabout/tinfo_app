@@ -50,6 +50,16 @@ dev_dependencies:
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.4
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  web:
+    generate: true
+  windows:
+    generate: true
+  image_path: "C:/Users/Admin/.cursor/projects/c-Users-Admin-Documents/assets/c__Users_Admin_AppData_Roaming_Cursor_User_workspaceStorage_75f82511e1e9d6de004f049e8f9218be_images_1024x1024ia-d0ba9db0-72bc-4696-91b7-ed34529d9e5e.png"
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
