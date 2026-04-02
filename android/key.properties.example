@@ -1,0 +1,8 @@
+# Copy to android/key.properties and fill in (do not commit key.properties).
+# Copy your .jks / .keystore from the other machine into android/ (same folder as this file).
+#
+# storeFile is relative to the android/ directory.
+storePassword=YOUR_STORE_PASSWORD
+keyPassword=YOUR_KEY_PASSWORD
+keyAlias=YOUR_KEY_ALIAS
+storeFile=upload-keystore.jks
