@@ -454,8 +454,7 @@ String _normalizeImageUrl(String value) {
     }
   }
 
-  // Route image loading through endpoint proxy for stable Flutter web rendering (bypasses CORS).
-  return 'https://www.tinfo.kz/endpoint/image.php?src=${Uri.encodeComponent(canonical)}';
+  return canonical;
 }
 
 const Set<String> _hiddenCategories = <String>{
