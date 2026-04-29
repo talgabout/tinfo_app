@@ -10,6 +10,8 @@ workflows:
       ios_signing:
         distribution_type: app_store
         bundle_identifier: kz.tinfo.news
+        provisioning_profiles:
+          - $PROVISIONING_PROFILE
     scripts:
       - name: Get Flutter packages
         script: flutter pub get
