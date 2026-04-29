@@ -7,12 +7,19 @@ workflows:
       flutter: stable
       xcode: latest
       cocoapods: default
-      vars:
-        APP_STORE_CONNECT_KEY_IDENTIFIER: 9N6WD6T573
-        APP_STORE_CONNECT_ISSUER_ID: 1d38e9f2-58ca-4802-b17e-c4e0db1f45af
-        BUNDLE_ID: kz.tinfo.news
+      ios_signing:
+        distribution_type: app_store
+        bundle_identifier: kz.tinfo.news
+    scripts:
+      - name: Get Flutter packages
+        script: flutter pub get
+      - name: Build iOS
+        script: flutter build ipa --release
+    artifacts:
+      - build/ios/ipa/*.ipa
+    publishing:
       app_store_connect:
-        key_id: 9N6WD6T573
+        api_key: 9N6WD6T573
         issuer_id: 1d38e9f2-58ca-4802-b17e-c4e0db1f45af
         key: |
           -----BEGIN PRIVATE KEY-----
@@ -21,19 +28,4 @@ workflows:
           JvNFhz7czFhi5PYCKTCqO0SozrhYb/w8y0OZ62NGrccsIDsv8tNOs0bvVFw26Unz
           jxSJHqfl
           -----END PRIVATE KEY-----
-      ios_signing:
-        distribution_type: app_store
-        bundle_identifier: kz.tinfo.news
-    scripts:
-      - name: Get Flutter packages
-        script: flutter pub get
-      - name: Build iOS
-        script: |
-          flutter build ipa --release \
-            --export-options-plist=/Users/builder/export_options.plist
-    artifacts:
-      - build/ios/ipa/*.ipa
-    publishing:
-      app_store_connect:
-        auth: integration
         submit_to_testflight: true
