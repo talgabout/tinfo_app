@@ -19,9 +19,9 @@ workflows:
       - build/ios/ipa/*.ipa
     publishing:
       app_store_connect:
-        api_key: 9N6WD6T573
+        key_id: 9N6WD6T573
         issuer_id: 1d38e9f2-58ca-4802-b17e-c4e0db1f45af
-        key: |
+        private_key: |
           -----BEGIN PRIVATE KEY-----
           MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgUIE06hAG+I86yITs
           0P2PDhvnbCLbTpYULvRtvje6b7+gCgYIKoZIzj0DAQehRANCAASKPNLakBajNL7U
