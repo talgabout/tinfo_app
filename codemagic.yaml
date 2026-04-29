@@ -7,6 +7,10 @@ workflows:
       flutter: stable
       xcode: latest
       cocoapods: default
+      vars:
+        APP_STORE_CONNECT_KEY_IDENTIFIER: $APP_STORE_CONNECT_KEY_IDENTIFIER
+        APP_STORE_CONNECT_ISSUER_ID: $APP_STORE_CONNECT_ISSUER_ID
+        APP_STORE_CONNECT_PRIVATE_KEY: $APP_STORE_CONNECT_PRIVATE_KEY
       ios_signing:
         distribution_type: app_store
         bundle_identifier: kz.tinfo.news
@@ -19,13 +23,7 @@ workflows:
       - build/ios/ipa/*.ipa
     publishing:
       app_store_connect:
-        key_id: 9N6WD6T573
-        issuer_id: 1d38e9f2-58ca-4802-b17e-c4e0db1f45af
-        private_key: |
-          -----BEGIN PRIVATE KEY-----
-          MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgUIE06hAG+I86yITs
-          0P2PDhvnbCLbTpYULvRtvje6b7+gCgYIKoZIzj0DAQehRANCAASKPNLakBajNL7U
-          JvNFhz7czFhi5PYCKTCqO0SozrhYb/w8y0OZ62NGrccsIDsv8tNOs0bvVFw26Unz
-          jxSJHqfl
-          -----END PRIVATE KEY-----
+        key_id: $APP_STORE_CONNECT_KEY_IDENTIFIER
+        issuer_id: $APP_STORE_CONNECT_ISSUER_ID
+        private_key: $APP_STORE_CONNECT_PRIVATE_KEY
         submit_to_testflight: true
