@@ -66,10 +66,22 @@ class _AppScrollBehavior extends MaterialScrollBehavior {
 }
 
 class NewsItem {
+  final int id;
+  final String category;
+  final String title;
+  final String? subtitle;
+  final String summary;
+  final String content;
+  final String summaryHtml;
+  final String contentHtml;
+  final String? imageUrl;
+  final DateTime? publishedAt;
+
   const NewsItem({
     required this.id,
     required this.category,
     required this.title,
+    this.subtitle,
     required this.summary,
     required this.content,
     required this.summaryHtml,
@@ -78,46 +90,84 @@ class NewsItem {
     this.publishedAt,
   });
 
-  final int id;
-  final String category;
-  final String title;
-  final String summary;
-  final String content;
-  final String summaryHtml;
-  final String contentHtml;
-  final String? imageUrl;
-  final DateTime? publishedAt;
-
   factory NewsItem.fromJson(Map<String, dynamic> json) {
     final idRaw = json['id'] ?? json['article_id'];
-    final title = _asString(
-      json['title'] ?? json['name'] ?? json['headline'],
-      fallback: 'No title',
-    );
-    final category = _asString(json['category'] ?? json['category_name'] ?? json['cat_name']);
-    final rawSummary = _asString(
-      json['summary'] ?? json['introtext'] ?? json['description'] ?? json['excerpt'],
-    );
-    final rawContent = _asString(
-      json['content'] ?? json['fulltext'] ?? json['body'] ?? rawSummary,
-    );
+
+    // Support WordPress-style title object or direct string (from user example)
+    final dynamic titleJson = json['title'];
+    final title = titleJson is Map
+        ? _asString(titleJson['rendered'])
+        : _asString(titleJson ?? json['name'] ?? json['headline'],
+            fallback: 'No title');
+
+    // Category handling: check direct string (user example), then _embedded
+    String category =
+        _asString(json['category'] ?? json['category_name'] ?? json['cat_name']);
+    if (category.isEmpty && json['_embedded'] != null) {
+      final dynamic terms = json['_embedded']['wp:term'];
+      if (terms is List && terms.isNotEmpty) {
+        for (final group in terms) {
+          if (group is List && group.isNotEmpty) {
+            for (final term in group) {
+              if (term is Map && term['taxonomy'] == 'category') {
+                category = _asString(term['name']);
+                break;
+              }
+            }
+          }
+          if (category.isNotEmpty) break;
+        }
+      }
+    }
+
+    // Support WordPress-style excerpt/content objects or direct strings
+    final dynamic excerptJson = json['excerpt'];
+    final rawSummary = excerptJson is Map
+        ? _asString(excerptJson['rendered'])
+        : _asString(
+            json['summary'] ?? json['introtext'] ?? json['description']);
+
+    final dynamic contentJson = json['content'];
+    final rawContent = contentJson is Map
+        ? _asString(contentJson['rendered'])
+        : _asString(json['fulltext'] ?? json['body'] ?? rawSummary);
+
     final summary = _stripHtml(rawSummary);
     final content = _stripHtml(rawContent);
-    final image = _normalizeImageUrl(_extractImageUrl(json));
-    final publishedAtRaw =
-        json['published_at'] ?? json['publish_up'] ?? json['created'] ?? json['date'];
 
-    return NewsItem(
-      id: _asInt(idRaw),
-      category: category,
-      title: title,
-      summary: summary,
-      content: content,
-      summaryHtml: rawSummary,
-      contentHtml: rawContent,
-      imageUrl: image.isEmpty ? null : image,
-      publishedAt: DateTime.tryParse(_asString(publishedAtRaw)),
-    );
+    // Image handling: support direct 'featured_image' string or _embedded media
+    String image = _asString(json['featured_image']);
+    if (image.isEmpty) image = _extractImageUrl(json);
+    if (image.isEmpty && json['_embedded'] != null) {
+      final dynamic media = json['_embedded']['wp:featuredmedia'];
+      if (media is List && media.isNotEmpty && media[0] is Map) {
+        image = _asString(media[0]['source_url']);
+      }
+    }
+    image = _normalizeImageUrl(image);
+
+    final publishedAtRaw = json['published_at'] ??
+        json['publish_up'] ??
+        json['created'] ??
+        json['date'];
+
+    try {
+      return NewsItem(
+        id: _asInt(idRaw),
+        category: category,
+        title: title,
+        subtitle: _asString(json['subtitle']),
+        summary: summary,
+        content: content,
+        summaryHtml: rawSummary,
+        contentHtml: rawContent,
+        imageUrl: image.isEmpty ? null : image,
+        publishedAt: DateTime.tryParse(_asString(publishedAtRaw)),
+      );
+    } catch (e, st) {
+      print('NewsItem.fromJson error: $e\n$st\nJSON: $json');
+      rethrow;
+    }
   }
 }
 
@@ -142,20 +192,15 @@ class NewsCategoryEntry {
 }
 
 class NewsApiService {
-  // New custom endpoint package in public_html/endpoint
-  static const String _apiBaseUrl = 'https://www.tinfo.kz/endpoint';
-  // Legacy fallback (temporary) while endpoint returns 500.
-  static const String _legacyWsBaseUrl = 'https://www.tinfo.kz/ws';
-  static const int _defaultCatId = 1;
-
-  /// Root category for «Все» / home feed (matches previous hard-coded list).
+  // WordPress REST API endpoint
+  static const String _apiBaseUrl = 'https://www.tinfo.kz/wp-json/wp/v2';
+  static const int _defaultCatId = 14; // "Новости" on tinfo.kz WP
   static const int kRootCategoryId = _defaultCatId;
 
-  /// Page size for list pagination (15–25 is typical for mobile feeds).
+  /// Page size for list pagination.
   static const int kNewsPageSize = 20;
 
-  /// One-based [page] for the primary API; legacy uses zero-based page index.
-  /// [categoryId] selects Joomla/K2 category; omit or use [kRootCategoryId] for the main tree.
+  /// Fetch a page of news using WordPress REST API.
   Future<List<NewsItem>> fetchNewsPage(
     int page, {
     int? limit,
@@ -166,13 +211,18 @@ class NewsApiService {
       throw ArgumentError.value(page, 'page', 'must be >= 1');
     }
     final catId = categoryId ?? kRootCategoryId;
+
     try {
-      final uri = Uri.parse(
-        '$_apiBaseUrl/news.php?categoryId=$catId&page=$page&limit=$lim',
-      );
+      // Use _embed to get featured media and terms (categories) in one request.
+      var url = '$_apiBaseUrl/posts?_embed&page=$page&per_page=$lim&orderby=date&order=desc';
+      if (catId != kRootCategoryId) {
+        url += '&categories=$catId';
+      }
+
+      final uri = Uri.parse(url);
       final response = await http.get(uri).timeout(
         const Duration(seconds: 12),
-        onTimeout: () => throw Exception('API timeout. Check endpoint URL and server.'),
+        onTimeout: () => throw Exception('API timeout. Check site connectivity.'),
       );
 
       if (response.statusCode != 200) {
@@ -182,54 +232,38 @@ class NewsApiService {
       final dynamic decoded = jsonDecode(response.body);
       final list = _extractNewsList(decoded);
       return list.map(NewsItem.fromJson).toList();
-    } catch (_) {
-      final legacyPage = page - 1;
-      final isRoot = catId == kRootCategoryId;
-      final legacyUri = isRoot
-          ? '$_legacyWsBaseUrl/getArticles.php?catId=$catId&page=$legacyPage&isparent=1'
-          : '$_legacyWsBaseUrl/getArticles.php?catId=$catId&page=$legacyPage';
-      final legacy = Uri.parse(legacyUri);
-      final response = await http.get(legacy).timeout(
-        const Duration(seconds: 12),
-        onTimeout: () => throw Exception('Legacy API timeout.'),
-      );
-      if (response.statusCode != 200) {
-        throw Exception('Failed to load legacy news: ${response.statusCode}');
-      }
-      final dynamic decoded = jsonDecode(response.body);
-      final list = _extractNewsList(decoded);
-      return list.map(NewsItem.fromJson).toList();
+    } catch (e) {
+      debugPrint('Error fetching news: $e');
+      rethrow;
     }
   }
 
-  /// First page only (used where a single batch is enough).
+  /// First page only.
   Future<List<NewsItem>> fetchNews() => fetchNewsPage(1);
 
+  /// Fetch categories that are children of the main "Новости" category.
   Future<List<NewsCategoryEntry>> fetchCategoryEntries() async {
-    final uri = Uri.parse('$_apiBaseUrl/categories.php?rootId=$_defaultCatId');
+    final uri = Uri.parse(
+        '$_apiBaseUrl/categories?parent=$_defaultCatId&per_page=100');
     final response = await http.get(uri).timeout(
       const Duration(seconds: 12),
-      onTimeout: () => throw Exception('API timeout. Check endpoint URL and server.'),
+      onTimeout: () => throw Exception('API timeout.'),
     );
+
     if (response.statusCode != 200) {
       throw Exception('Failed to load categories: ${response.statusCode}');
     }
 
     final dynamic decoded = jsonDecode(response.body);
-    final map = _extractResponseMap(decoded);
-    if ((map['ok'] as bool?) == false) {
-      throw Exception(_asString(map['error'], fallback: 'Categories request failed'));
-    }
-
-    final dynamic items = map['items'];
-    if (items is! List) {
+    if (decoded is! List) {
       return <NewsCategoryEntry>[];
     }
+
     final out = <NewsCategoryEntry>[];
-    for (final raw in items) {
+    for (final raw in decoded) {
       if (raw is Map<String, dynamic>) {
         final name = _asString(raw['name']).trim();
-        final id = _asInt(raw['id'] ?? raw['catid'] ?? raw['category_id'] ?? raw['categoryId']);
+        final id = _asInt(raw['id']);
         if (id > 0 && _isVisibleCategory(name)) {
           out.add(NewsCategoryEntry(id: id, name: name));
         }
@@ -238,67 +272,43 @@ class NewsApiService {
     return out;
   }
 
+  /// Latest posts with is_featured flag for the slider.
   Future<List<NewsItem>> fetchFeatured() async {
     try {
-      final uri = Uri.parse('$_apiBaseUrl/featured.php?categoryId=$_defaultCatId&limit=5');
-      final response = await http.get(uri).timeout(
-        const Duration(seconds: 12),
-        onTimeout: () => throw Exception('API timeout. Check endpoint URL and server.'),
-      );
+      const url = 'https://www.tinfo.kz/wp-json/tinfo/v1/featured?per_page=10';
+      final response = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 12));
 
       if (response.statusCode != 200) {
-        throw Exception('Failed to load featured news: ${response.statusCode}');
+        return fetchNewsPage(1, limit: 5);
       }
 
       final dynamic decoded = jsonDecode(response.body);
       final list = _extractNewsList(decoded);
+      if (list.isEmpty) return fetchNewsPage(1, limit: 5);
       return list.map(NewsItem.fromJson).toList();
-    } catch (_) {
-      final fallback = await fetchNews();
-      return fallback.where((item) => item.category.isNotEmpty).take(5).toList();
+    } catch (e) {
+      return fetchNewsPage(1, limit: 5);
     }
   }
 
+  /// Single article detail.
   Future<NewsItem> fetchArticleDetail(int itemId) async {
-    try {
-      final uri = Uri.parse('$_apiBaseUrl/article.php?id=$itemId');
-      final response = await http.get(uri).timeout(
-        const Duration(seconds: 12),
-        onTimeout: () => throw Exception('API timeout. Check endpoint URL and server.'),
-      );
+    final uri = Uri.parse('$_apiBaseUrl/posts/$itemId?_embed');
+    final response = await http.get(uri).timeout(
+      const Duration(seconds: 12),
+      onTimeout: () => throw Exception('API timeout.'),
+    );
 
-      if (response.statusCode != 200) {
-        throw Exception('Failed to load article: ${response.statusCode}');
-      }
-
-      final dynamic decoded = jsonDecode(response.body);
-      final map = _extractResponseMap(decoded);
-      if ((map['ok'] as bool?) == false) {
-        throw Exception(_asString(map['error'], fallback: 'Article request failed'));
-      }
-
-      final dynamic item = map['item'];
-      if (item is! Map<String, dynamic>) {
-        throw Exception('Article not found');
-      }
-
-      return NewsItem.fromJson(item);
-    } catch (_) {
-      final legacy = Uri.parse('$_legacyWsBaseUrl/getArticleDetail.php?itemid=$itemId');
-      final response = await http.get(legacy).timeout(
-        const Duration(seconds: 12),
-        onTimeout: () => throw Exception('Legacy article API timeout.'),
-      );
-      if (response.statusCode != 200) {
-        throw Exception('Failed to load legacy article: ${response.statusCode}');
-      }
-      final dynamic decoded = jsonDecode(response.body);
-      final list = _extractNewsList(decoded);
-      if (list.isEmpty) {
-        throw Exception('Article not found');
-      }
-      return NewsItem.fromJson(list.first);
+    if (response.statusCode != 200) {
+      throw Exception('Failed to load article: ${response.statusCode}');
     }
+
+    final dynamic decoded = jsonDecode(response.body);
+    if (decoded is! Map<String, dynamic>) {
+      throw Exception('Article not found');
+    }
+
+    return NewsItem.fromJson(decoded);
   }
 
   Future<List<String>> fetchCategories() async {
@@ -308,29 +318,20 @@ class NewsApiService {
 }
 
 List<Map<String, dynamic>> _extractNewsList(dynamic decoded) {
-  final map = _extractResponseMap(decoded);
-  if ((map['ok'] as bool?) == false) {
-    throw Exception(_asString(map['error'], fallback: 'News request failed'));
-  }
-
-  final dynamic data = map['items'] ?? map['data'] ?? map['news'];
-  if (data is List) {
-    return data.whereType<Map<String, dynamic>>().toList();
-  }
-
   if (decoded is List) {
     return decoded.whereType<Map<String, dynamic>>().toList();
   }
-
-  throw Exception('Unexpected API response format');
-}
-
-Map<String, dynamic> _extractResponseMap(dynamic decoded) {
-  if (decoded is Map<String, dynamic>) {
-    return decoded;
+  if (decoded is Map) {
+    // Support wrappers like {"posts": [...]} or {"items": [...]}
+    final dynamic items =
+        decoded['posts'] ?? decoded['items'] ?? decoded['data'] ?? decoded['news'];
+    if (items is List) {
+      return items.whereType<Map<String, dynamic>>().toList();
+    }
   }
-  return <String, dynamic>{};
+  return <Map<String, dynamic>>[];
 }
+
 
 int _asInt(dynamic value) {
   if (value is int) {
@@ -440,22 +441,20 @@ String _normalizeImageUrl(String value) {
   if (!(trimmed.startsWith('http://') || trimmed.startsWith('https://'))) {
     return '';
   }
+  // Normalize to HTTPS and tinfo.kz domain if it's a local media path.
   var canonical = trimmed
       .replaceFirst('http://', 'https://')
       .replaceAll('://tinfo.kz', '://www.tinfo.kz');
 
   final uri = Uri.tryParse(canonical);
   if (uri != null) {
-    // Normalize all legacy media hosts to current site domain.
-    if (uri.path.startsWith('/media/k2/')) {
+    if (uri.path.startsWith('/media/k2/') ||
+        uri.path.startsWith('/wp-content/')) {
       canonical = 'https://www.tinfo.kz${uri.path}';
     }
   }
 
-  // Route image loading through endpoint proxy for stable Flutter web rendering.
-  if (canonical.contains('www.tinfo.kz/endpoint/image.php?src=')) {
-    return canonical;
-  }
+  // Route image loading through endpoint proxy for stable Flutter web rendering (bypasses CORS).
   return 'https://www.tinfo.kz/endpoint/image.php?src=${Uri.encodeComponent(canonical)}';
 }
 
